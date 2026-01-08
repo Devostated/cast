@@ -72,19 +72,35 @@ def utilityBuildPath(root, asset):
 
 def utilityQuaternionToEuler(tempQuat):
     quaternion = c4d.Quaternion()
+    # Normalize the quaternion to avoid acos domain issues without clamping w.
+    tx = tempQuat[0]
+    ty = tempQuat[1]
+    tz = tempQuat[2]
+    tw = tempQuat[3]
 
-    w = tempQuat[3]
+    norm = math.sqrt(tx * tx + ty * ty + tz * tz + tw * tw)
+    if norm <= 1e-9:
+        quaternion.SetAxis(Vector(0, 0, 0), 0)
+        return c4d.utils.MatrixToHPB(quaternion.GetMatrix(), c4d.ROTATIONORDER_HPB)
+
+    x = tx / norm
+    y = ty / norm
+    z = tz / norm
+    w = tw / norm
+
     ww = 2 * math.acos(w)
-    sqrt = math.sqrt(1 - w * w)
 
-    if sqrt <= 1e-9:
-        x = y = z = 0
+    val = 1.0 - w * w
+    s = math.sqrt(val) if val > 0.0 else 0.0
+
+    if s <= 1e-9:
+        ax = ay = az = 0
     else:
-        x = tempQuat[0] / sqrt
-        y = tempQuat[1] / sqrt
-        z = tempQuat[2] / sqrt
+        ax = x / s
+        ay = y / s
+        az = z / s
 
-    quaternion.SetAxis(Vector(x, y, -z), ww)
+    quaternion.SetAxis(Vector(ax, ay, -az), ww)
     return c4d.utils.MatrixToHPB(quaternion.GetMatrix(), c4d.ROTATIONORDER_HPB)
 
 
