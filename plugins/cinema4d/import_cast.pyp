@@ -120,6 +120,7 @@ def utilityCreateDefaultMaterial(path, material):
         "diffuse": c4d.MATERIAL_COLOR_SHADER,
         "specular": reflLayer.GetDataID() + c4d.REFLECTION_LAYER_COLOR_TEXTURE,
         "normal": c4d.MATERIAL_NORMAL_SHADER,
+        "metal": reflLayer.GetDataID() + c4d.REFLECTION_LAYER_TRANS_TEXTURE,
         "roughness": reflLayer.GetDataID() + c4d.REFLECTION_LAYER_MAIN_SHADER_ROUGHNESS,
         "gloss": reflLayer.GetDataID() + c4d.REFLECTION_LAYER_MAIN_SHADER_ROUGHNESS,
         "emissive": c4d.MATERIAL_LUMINANCE_SHADER,
@@ -168,7 +169,7 @@ def utilityCreateDefaultMaterial(path, material):
 
 
 def importMaterialNode(context, path, material):
-    # We're checking if the material is already present in the project and import context
+    # We're checking if the material is already present in the project or in the import context
     doc = c4d.documents.GetActiveDocument()
     docMaterials = doc.GetMaterials()
     contextMaterials = context.GetMaterials()
@@ -599,7 +600,7 @@ def importInstanceNodes(doc, node, instanceNodes, path):
 
 
 if __name__ == '__main__':
-    reg = plugins.RegisterSceneLoaderPlugin(id=SCENE_LOADER_PLUGIN_ID,
+    plugins.RegisterSceneLoaderPlugin(id=SCENE_LOADER_PLUGIN_ID,
                                             str=__pluginname__,
                                             info=0,
                                             g=CastLoader,
