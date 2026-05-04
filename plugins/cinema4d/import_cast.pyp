@@ -2,6 +2,7 @@ import c4d
 import os
 import math
 import mxutils
+import sys
 
 from c4d import plugins, Vector, Vector4d, CPolygon, gui, BaseObject
 
@@ -12,7 +13,8 @@ mxutils.ImportSymbols(PLUGIN_RES_DIR)
 with mxutils.LocalImportPath(PLUGIN_RES_DIR):
     from cast import Cast, CastColor, Model, Animation, Instance, Metadata, File, Color
 
-__pluginname__ = "Cast (*.cast)"
+version = "1.78"
+__pluginname__ = f"Cast {version} (*.cast)"
 
 
 class CastLoader(plugins.SceneLoaderData):
@@ -30,6 +32,7 @@ class CastLoader(plugins.SceneLoaderData):
 
     def Load(self, node, name, doc, filterflags, error, bt):
         importCast(doc, node, name)
+        c4d.EventAdd()
         return c4d.FILEERROR_NONE
 
 
@@ -171,10 +174,10 @@ def utilityCreateDefaultMaterial(path, material):
 def importMaterialNode(context, path, material):
     # We're checking if the material is already present in the project or in the import context
     doc = c4d.documents.GetActiveDocument()
-    docMaterials = doc.GetMaterials()
-    contextMaterials = context.GetMaterials()
-    for mat in docMaterials + contextMaterials:
+    for mat in doc.GetMaterials() + context.GetMaterials():
         if mat.GetName() == material.Name():
+            mat.Message(c4d.MSG_UPDATE)
+            mat.Update(True, True)
             return mat
 
     mat = utilityCreateDefaultMaterial(path, material)
@@ -198,7 +201,7 @@ def importModelNode(doc, node, model, path):
     modelNull[c4d.ID_BASELIST_ICON_COLOR] = Vector(0.816, 0.357, 0.259)
 
     doc.InsertObject(modelNull)
-
+    modelNull.InsertTag(c4d.BaseTag(TAG_PLUGIN_ID))
     # Import skeleton for binds, materials for meshes
     bones = importSkeletonNode(modelNull, model.Skeleton())
     materialArray = {x.Name(): importMaterialNode(doc, path, x)
@@ -310,22 +313,39 @@ def importModelNode(doc, node, model, path):
                 weightTag.AddJoint(bone)
 
             maximumInfluence = mesh.MaximumWeightInfluence()
-            if maximumInfluence > 1:  # Slower path for complex weights
+            # Use SetWeightMap for performance instead of many SetWeight calls.
+            if maximumInfluence > 0:
                 weightBoneBuffer = mesh.VertexWeightBoneBuffer()
-                weightValueBuffer = mesh.VertexWeightValueBuffer()
+                # For complex blends we also need the values buffer
+                weightValueBuffer = mesh.VertexWeightValueBuffer() if maximumInfluence > 1 else None
 
-                for x in range(vertexCount):
-                    for j in range(maximumInfluence):
-                        weightIndex = j + (x * maximumInfluence)
-                        weightValue = weightTag.GetWeight(
-                            weightBoneBuffer[weightIndex], x)
-                        weightValue += weightValueBuffer[weightIndex]
-                        weightTag.SetWeight(
-                            weightBoneBuffer[weightIndex], x, weightValue)
-            elif maximumInfluence > 0:  # Fast path for simple weighted meshes
-                weightBoneBuffer = mesh.VertexWeightBoneBuffer()
-                for x in range(vertexCount):
-                    weightTag.SetWeight(weightBoneBuffer[x], x, 1.0)
+                jointCount = weightTag.GetJointCount()
+                # Initialize maps per joint
+                maps = [[0.0] * vertexCount for _ in range(jointCount)]
+
+                if maximumInfluence > 1:
+                    for v in range(vertexCount):
+                        base = v * maximumInfluence
+                        for j in range(maximumInfluence):
+                            idx = base + j
+                            jointIndex = weightBoneBuffer[idx]
+                            if jointIndex < 0 or jointIndex >= jointCount:
+                                continue
+                            maps[jointIndex][v] += weightValueBuffer[idx]
+                else:
+                    # Single influence per-vertex, assume full weight
+                    for v in range(vertexCount):
+                        jointIndex = weightBoneBuffer[v]
+                        if jointIndex < 0 or jointIndex >= jointCount:
+                            continue
+                        maps[jointIndex][v] = 1.0
+
+                # Apply maps using SetWeightMap
+                for jidx in range(jointCount):
+                    # Only set when there is at least one non-zero weight to avoid unnecessary calls
+                    map_j = maps[jidx]
+                    if any(w != 0.0 for w in map_j):
+                        weightTag.SetWeightMap(jidx, map_j)
 
             weightTag.Message(c4d.MSG_UPDATE)
 
@@ -515,9 +535,289 @@ def importSkeletonNode(modelNull, skeleton):
     return boneNames
 
 
-def importAnimationNode():
-    gui.MessageDialog(
-        text="Animations are currently not supported.", type=c4d.GEMB_ICONSTOP)
+def utilityAddKeyframe(curve, time, value):
+    key = curve.AddKey(time)
+    key["key"].SetValue(curve, value)
+
+
+def utilityGetTrack(targetObj, descid, mode):
+    track = targetObj.FindCTrack(descid)
+    if track:
+        track.FlushData()
+    else:
+        track = c4d.CTrack(targetObj, descid)
+        targetObj.InsertTrackSorted(track)
+    return track
+
+
+def utilityResolveCurveModeOverride(obj, mode, overrides, isTranslate=False, isRotate=False, isScale=False):
+    if not overrides:
+        return mode
+
+    for parent in obj.GetUp():
+        if parent.GetType() == c4d.Ojoint:
+            for override in overrides:
+                if isTranslate and not override.OverrideTranslationCurves():
+                    continue
+                elif isRotate and not override.OverrideRotationCurves():
+                    continue
+                elif isScale and not override.OverrideScaleCurves():
+                    continue
+
+                if parent.GetName() == override.NodeName():
+                    return override.Mode()
+
+
+def utilityRotCurveNode(doc, mode, targetObj, overrides, keyFrameBuffer, keyValueBuffer, fps):
+    rotationMap = {
+        "x": c4d.DescID(c4d.DescLevel(c4d.ID_BASEOBJECT_ROTATION, c4d.DTYPE_VECTOR, 0),
+                          c4d.DescLevel(c4d.VECTOR_X, c4d.DTYPE_REAL, 0)),
+        "y": c4d.DescID(c4d.DescLevel(c4d.ID_BASEOBJECT_ROTATION, c4d.DTYPE_VECTOR, 0),
+                          c4d.DescLevel(c4d.VECTOR_Y, c4d.DTYPE_REAL, 0)),
+        "z": c4d.DescID(c4d.DescLevel(c4d.ID_BASEOBJECT_ROTATION, c4d.DTYPE_VECTOR, 0),
+                          c4d.DescLevel(c4d.VECTOR_Z, c4d.DTYPE_REAL, 0))
+    }
+    
+    tracks = {axis: utilityGetTrack(targetObj, descid, mode) for axis, descid in rotationMap.items()}
+    curves = {axis: track.GetCurve() for axis, track in tracks.items()}
+    mode = utilityResolveCurveModeOverride(
+        targetObj, mode, overrides, isRotate=True)
+
+    for curve in curves.values():
+        curve.FlushKeys()
+    
+    minTime = doc.GetMinTime()
+    for i, frame in enumerate(keyFrameBuffer):
+        key_time = minTime + c4d.BaseTime(frame, fps)
+        quat = keyValueBuffer[i * 4:(i + 1) * 4]
+        euler = utilityQuaternionToEuler(quat)
+        if mode == "relative" or mode == "additive":
+            euler += targetObj.GetRelRot()
+
+        utilityAddKeyframe(curves["x"], key_time, euler.x)
+        utilityAddKeyframe(curves["y"], key_time, euler.y)
+        utilityAddKeyframe(curves["z"], key_time, euler.z)
+    
+    targetObj.FindBestEulerAngle(c4d.ID_BASEOBJECT_ROTATION, True, False)
+
+
+def utilityCurveNodes(doc, mode, targetObj, overrides, keyFrameBuffer, keyValueBuffer, fps, prop):
+    propDescMap = {
+        "tx": c4d.DescID(c4d.DescLevel(c4d.ID_BASEOBJECT_POSITION, c4d.DTYPE_VECTOR, 0),
+                           c4d.DescLevel(c4d.VECTOR_X, c4d.DTYPE_REAL, 0)),
+        "ty": c4d.DescID(c4d.DescLevel(c4d.ID_BASEOBJECT_POSITION, c4d.DTYPE_VECTOR, 0),
+                           c4d.DescLevel(c4d.VECTOR_Y, c4d.DTYPE_REAL, 0)),
+        "tz": c4d.DescID(c4d.DescLevel(c4d.ID_BASEOBJECT_POSITION, c4d.DTYPE_VECTOR, 0),
+                           c4d.DescLevel(c4d.VECTOR_Z, c4d.DTYPE_REAL, 0)),
+        "sx": c4d.DescID(c4d.DescLevel(c4d.ID_BASEOBJECT_SCALE, c4d.DTYPE_VECTOR, 0),
+                           c4d.DescLevel(c4d.VECTOR_X, c4d.DTYPE_REAL, 0)),
+        "sy": c4d.DescID(c4d.DescLevel(c4d.ID_BASEOBJECT_SCALE, c4d.DTYPE_VECTOR, 0),
+                           c4d.DescLevel(c4d.VECTOR_Y, c4d.DTYPE_REAL, 0)),
+        "sz": c4d.DescID(c4d.DescLevel(c4d.ID_BASEOBJECT_SCALE, c4d.DTYPE_VECTOR, 0),
+                           c4d.DescLevel(c4d.VECTOR_Z, c4d.DTYPE_REAL, 0))
+    }
+
+    propRelMap = {
+        "tx": targetObj.GetRelPos().x,
+        "ty": targetObj.GetRelPos().y,
+        "tz": targetObj.GetRelPos().z,
+        "sx": targetObj.GetRelScale().x,
+        "sy": targetObj.GetRelScale().y,
+        "sz": targetObj.GetRelScale().z,
+    }
+    
+    descid = propDescMap.get(prop)
+    relative = propRelMap.get(prop)
+    if not descid:
+        return None
+    
+    if prop in ["tx", "ty", "tz"]:
+        mode = utilityResolveCurveModeOverride(
+            targetObj, mode, overrides, isTranslate=True)
+    elif prop in ["sx", "sy", "sz"]:
+        mode = utilityResolveCurveModeOverride(
+            targetObj, mode, overrides, isScale=True)
+    
+    track = utilityGetTrack(targetObj, descid, mode)
+    curve = track.GetCurve()
+    curve.FlushKeys()
+    
+    minTime = doc.GetMinTime()
+    for frame, value in zip(keyFrameBuffer, keyValueBuffer):
+        key_time = minTime + c4d.BaseTime(frame, fps)
+        if prop == "tz":
+            value = -value
+        if mode == "relative" or mode == "additive":
+            value += relative
+        utilityAddKeyframe(curve, key_time, value)
+    
+
+def importAnimationNode(doc, node, animationNode):
+    castImportPath = node[c4d.TCAST_IMPORT_PATH]
+    castImportTime = node[c4d.TCAST_IMPORT_TIME]
+    castImportReset = node[c4d.TCAST_IMPORT_RESET]
+    tagObject = node.GetObject()
+
+
+    animName = animationNode.Name() or os.path.splitext(os.path.basename(castImportPath))[0]
+
+    joints = utilityGetJointsInHierarchy(tagObject)
+    for joint in joints:
+        joint[c4d.ID_BASEOBJECT_QUATERNION_ROTATION_INTERPOLATION] = 1
+
+    takeData = doc.GetTakeData()
+    mainTake = takeData.GetMainTake()
+    if castImportReset:
+        utilityResetBindPose(doc, node)
+        actionTake = takeData.AddTake(name=animName, parent=mainTake, cloneFrom=None)
+        actionTake.OverrideNode(takeData, node, False)
+        actionTake.OverrideNode(takeData, tagObject, False)
+        for joint in joints:
+            actionTake.OverrideNode(takeData, joint, False)
+    else:
+        actionTake = takeData.GetCurrentTake()
+    takeData.SetCurrentTake(actionTake)
+
+    
+
+    doc.SetFps(int(animationNode.Framerate()))
+    fps = doc.GetFps()
+
+    # We need to determine the proper time to import the curves, for example
+    # the user may want to import at the current scene time, and that would require
+    # fetching once here, then passing to the curve importer.
+    wantedSmallestFrame = sys.maxsize
+    wantedLargestFrame = 1
+
+    if castImportTime:
+        doc.SetMinTime(c4d.BaseTime(doc.GetTime().GetFrame(fps), fps))
+    else:
+        doc.SetMinTime(c4d.BaseTime(0, fps))
+    minTime = doc.GetMinTime()
+
+
+
+
+
+
+    curves = animationNode.Curves()
+    curveModeOverrides = animationNode.CurveModeOverrides()
+
+    poseBones = { bone.GetName().lower(): bone for bone in joints }
+    curves = animationNode.Curves()
+    for curve in curves:
+        targetJoint = poseBones.get(curve.NodeName().lower())
+        if targetJoint is not None:
+            # importCastCurveAnimation(doc, curve, targetJoint)
+            keyFrameBuffer = curve.KeyFrameBuffer()
+            keyValueBuffer = curve.KeyValueBuffer()
+            if not keyFrameBuffer or not keyValueBuffer:
+                return
+            property = curve.KeyPropertyName().lower()
+            mode = curve.Mode()
+            if property == "rq":
+                utilityRotCurveNode(doc, mode, targetJoint, curveModeOverrides, keyFrameBuffer, keyValueBuffer, fps)
+            else:
+                utilityCurveNodes(doc, mode, targetJoint, curveModeOverrides, keyFrameBuffer, keyValueBuffer, fps, property)
+                
+            
+
+    for x in animationNode.Notifications():
+        (smallestFrame, largestFrame) = importNotificationTrackNode(doc, animName, x, fps, minTime)
+        wantedSmallestFrame = min(smallestFrame, wantedSmallestFrame)
+        wantedLargestFrame = max(largestFrame, wantedLargestFrame)
+
+
+
+
+    # Update frame boundaries based on curve keyframes.
+    for curve in curves:
+        keyFrames = curve.KeyFrameBuffer()
+        if keyFrames:
+            smallest = min(keyFrames)
+            largest = max(keyFrames)
+            if smallest < wantedSmallestFrame:
+                wantedSmallestFrame = smallest
+            if largest > wantedLargestFrame:
+                wantedLargestFrame = largest
+
+    doc.SetMaxTime(minTime.__add__(c4d.BaseTime(wantedLargestFrame, fps)))
+
+
+def utilityLayerManage(doc, name):
+    layerRoot = doc.GetLayerObjectRoot()
+    layer = layerRoot.GetDown()
+
+    while layer:
+        if layer.GetName() == name:
+            return layer
+        layer = layer.GetNext()
+
+    newLayer = c4d.documents.LayerObject()
+    newLayer.SetName(name)
+    newLayer.InsertUnder(layerRoot)
+
+    c4d.EventAdd()
+    return newLayer
+
+
+def importNotificationTrackNode(doc, animName, node, fps, frameStart):
+    frameBuffer = node.KeyFrameBuffer()
+    layer = utilityLayerManage(doc, animName)
+
+    smallestFrame = sys.maxsize
+    largestFrame = 0
+
+    lastMarker = c4d.documents.GetFirstMarker(doc)
+    while lastMarker and lastMarker.GetNext():
+        lastMarker = lastMarker.GetNext()
+
+    for frameOffset in frameBuffer:
+        baseTime = c4d.BaseTime(frameOffset, fps) + frameStart
+
+        marker = c4d.documents.AddMarker(doc, lastMarker, baseTime, node.Name())
+        if marker:
+            marker[c4d.ID_LAYER_LINK] = layer
+            lastMarker = marker
+
+            smallestFrame = min(smallestFrame, smallestFrame)
+            largestFrame = max(largestFrame, largestFrame)
+
+    c4d.EventAdd()
+    return (smallestFrame, largestFrame)
+
+
+def utilityGetJointsInHierarchy(obj, joints=None):
+    if joints is None:
+        joints = []
+
+    if obj.GetType() == c4d.Ojoint:
+        joints.append(obj)
+
+    child = obj.GetDown()
+    while child:
+        utilityGetJointsInHierarchy(child, joints)
+        child = child.GetNext()
+
+    return joints
+
+
+def utilityResetBindPose(doc, castTag):
+    obj = castTag.GetObject()
+    mesh = []
+
+    child = obj.GetDown() if obj else None
+    while child:
+        if child.GetType() == c4d.Opolygon:
+            mesh.append(child)
+        child = child.GetNext()
+
+    for m in mesh:
+        weightTag = m.GetTag(c4d.Tweights)
+        if weightTag:
+            weightTag.ResetBindPose(doc, True)
+
+    return True
 
 
 def importInstanceNodes(doc, node, instanceNodes, path):
@@ -599,10 +899,53 @@ def importInstanceNodes(doc, node, instanceNodes, path):
         gui.MessageDialog(text="Some instances failed to import.\nCheck the console for more details. ", type=c4d.GEMB_ICONEXCLAMATION)
 
 
+class CastTag(plugins.TagData):
+    def Init(self, node, isCloneInit):
+        self.InitAttr(node, str, c4d.TCAST_IMPORT_PATH)
+        self.InitAttr(node, bool, c4d.TCAST_IMPORT_TIME)
+        self.InitAttr(node, bool, c4d.TCAST_IMPORT_RESET)
+        node[c4d.TCAST_IMPORT_PATH] = ""
+        node[c4d.TCAST_IMPORT_TIME] = False
+        node[c4d.TCAST_IMPORT_RESET] = False
+
+        return True
+
+    def Message(self, node, type, data):
+        if type == c4d.MSG_DESCRIPTION_COMMAND:
+            if not data: return
+            commandId = data['id'][0].id
+            doc = c4d.documents.GetActiveDocument()
+            if commandId == c4d.TCAST_IMPORT_BTN and "cast" in node[c4d.TCAST_IMPORT_PATH][-4:]:
+                cast = Cast.load(node[c4d.TCAST_IMPORT_PATH])
+                for root in cast.Roots():
+                    for child in root.ChildrenOfType(Model):
+                        print("Please Use Animation Nodes")
+                    for child in root.ChildrenOfType(Animation):
+                        importAnimationNode(doc, node, child)
+                    for child in root.ChildrenOfType(Instance):
+                        print("Please Use Animation Nodes")
+
+            if commandId == c4d.TCAST_RESET_BTN:
+                utilityResetBindPose(doc, node)
+
+        return True
+
+
 if __name__ == '__main__':
+    fn = os.path.join(PLUGIN_RES_DIR, "icon", "icon.png")
+    bmp = c4d.bitmaps.BaseBitmap()
+    bmp.InitWith(fn)
+
     plugins.RegisterSceneLoaderPlugin(id=SCENE_LOADER_PLUGIN_ID,
                                             str=__pluginname__,
                                             info=0,
                                             g=CastLoader,
                                             description="fcastloader",
                                             )
+
+    plugins.RegisterTagPlugin(id=TAG_PLUGIN_ID,
+                                            str=__pluginname__,
+                                            info=c4d.TAG_EXPRESSION | c4d.TAG_VISIBLE,
+                                            g=CastTag,
+                                            description="tcasttag",
+                                            icon=bmp)

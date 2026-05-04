@@ -1,0 +1,9 @@
+STRINGTABLE tcasttag
+{
+	tcasttag				"CastTag";
+	TCAST_IMPORT_PATH       "Cast Animation";
+	TCAST_IMPORT_TIME		"Import At Scene Time";
+	TCAST_IMPORT_RESET		"Import Resets Scene";
+	TCAST_IMPORT_BTN		"Import";
+	TCAST_RESET_BTN			"Reset Scene";
+}
